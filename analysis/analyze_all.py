@@ -1,7 +1,11 @@
 import os
 import json
+from pathlib import Path
 import pandas as pd
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DATA_DIR = _REPO_ROOT / "data"
 
 def run_full_analysis():
     report_lines = []
@@ -12,7 +16,7 @@ def run_full_analysis():
     # 1. Root-level Participant Overview
     report_lines.append("## 1. Root-Level Participant Overview\n")
     report_lines.append("**File:** `participant-overview.xlsx`\n")
-    overview_path = "participant-overview.xlsx"
+    overview_path = _DATA_DIR / "participant-overview.xlsx"
     if os.path.exists(overview_path):
         df_ov = pd.read_excel(overview_path)
         # Headers from row 0
@@ -70,7 +74,7 @@ def run_full_analysis():
     # Aggregate stats across participants for reporting.csv
     rep_dfs = []
     for p in participants:
-        p_path = f"{p}/googledocs/reporting.csv"
+        p_path = _DATA_DIR / p / "googledocs" / "reporting.csv"
         if os.path.exists(p_path):
             df = pd.read_csv(p_path)
             df['participant'] = p
@@ -103,7 +107,7 @@ def run_full_analysis():
     
     wel_dfs = []
     for p in participants:
-        p_path = f"{p}/pmsys/wellness.csv"
+        p_path = _DATA_DIR / p / "pmsys" / "wellness.csv"
         if os.path.exists(p_path):
             df = pd.read_csv(p_path)
             wel_dfs.append(df)
@@ -131,7 +135,7 @@ def run_full_analysis():
     
     srpe_dfs = []
     for p in participants:
-        p_path = f"{p}/pmsys/srpe.csv"
+        p_path = _DATA_DIR / p / "pmsys" / "srpe.csv"
         if os.path.exists(p_path):
             df = pd.read_csv(p_path)
             srpe_dfs.append(df)
@@ -172,7 +176,7 @@ def run_full_analysis():
 
     ss_dfs = []
     for p in participants:
-        p_path = f"{p}/fitbit/sleep_score.csv"
+        p_path = _DATA_DIR / p / "fitbit" / "sleep_score.csv"
         if os.path.exists(p_path):
             df = pd.read_csv(p_path)
             ss_dfs.append(df)
@@ -205,7 +209,7 @@ def run_full_analysis():
     report_lines.append("- **Data Completeness & Observations:** Participant overview data covers 16 participants, whereas detailed raw sensor and CSV logs (`p01`, `p03`, `p05`) are present for active study participants. Note that participant `p03` lacks `heart_rate.json`, which should be accounted for in advanced cardiovascular analyses.")
     report_lines.append("- **Consistency:** Naming conventions and schemas across `p01`, `p03`, and `p05` are highly standardized, making ingestion and comparative longitudinal analysis straightforward using Python/Pandas.\n")
 
-    report_path = "/home/maxime/PersoProj/MAUNA/Test technique/Test technique/analysis/findings.md"
+    report_path = Path(__file__).resolve().parent / "findings.md"
     with open(report_path, "w") as f:
         f.write("\n".join(report_lines))
     print(f"Findings report successfully written to {report_path}")

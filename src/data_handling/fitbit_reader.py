@@ -21,9 +21,10 @@ import pandas as pd
 from src.utils.date_handler import standardize_date, _resolve_bounds, _is_date_only, _matches
 
 _BASE_DIR = Path(__file__).resolve().parents[2]
+_DATA_DIR = _BASE_DIR / "data"
 
 def _fitbit_file(player_id: str, filename: str):
-    path = _BASE_DIR / player_id / "fitbit" / filename
+    path = _DATA_DIR / player_id / "fitbit" / filename
     if not path.is_file():
         return None
     return path

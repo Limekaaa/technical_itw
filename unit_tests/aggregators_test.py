@@ -1,6 +1,10 @@
 import unittest
-from src.data_handling import fitbit_reader, pmsys_reader, reporting_reader
+from pathlib import Path
+from unittest import mock
+from src.data_handling import fitbit_reader, pmsys_reader, reporting_reader, food_reader, aggregator
 import pandas as pd
+
+_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 
 class TestFitbitReader(unittest.TestCase):
@@ -136,6 +140,160 @@ class TestReportingReader(unittest.TestCase):
 
     def test_unknown_player_returns_empty(self):
         self.assertEqual(len(reporting_reader.reporting_reader("p99", "06/11/2019", "10/11/2019")), 0)
+
+
+CANNED_MACROS_JSON = '{"calories": 500, "protein": 20, "carbohydrates": 60, "fats": 15}'
+CANNED_MACROS = {"calories": 500, "protein": 20, "carbohydrates": 60, "fats": 15}
+
+
+def _mock_client(answer):
+    client = mock.MagicMock()
+    client.interactions.create.return_value.output_text = answer
+    return client
+
+
+class TestFoodReader(unittest.TestCase):
+    def test_helper_parses_macro_json(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        with mock.patch.object(food_reader, "client", _mock_client(CANNED_MACROS_JSON)):
+            self.assertEqual(
+                food_reader.helper_get_macro_nutrients_from_photos([photo]),
+                CANNED_MACROS,
+            )
+
+    def test_helper_no_json_returns_empty(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        with mock.patch.object(food_reader, "client", _mock_client("not food")):
+            self.assertEqual(
+                food_reader.helper_get_macro_nutrients_from_photos([photo]), {}
+            )
+
+    def test_is_photo_food_yes_no(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        with mock.patch.object(food_reader, "client", _mock_client("YES")):
+            self.assertTrue(food_reader.is_photo_food(photo))
+        with mock.patch.object(food_reader, "client", _mock_client("NO")):
+            self.assertFalse(food_reader.is_photo_food(photo))
+
+    def test_image_part_uses_data_key(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        client = _mock_client("YES")
+        with mock.patch.object(food_reader, "client", client):
+            food_reader.is_photo_food(photo)
+        text_part, img_part = client.interactions.create.call_args.kwargs["input"]
+        self.assertEqual(text_part["type"], "text")
+        self.assertEqual(img_part["type"], "image")
+        self.assertIn("data", img_part)
+        self.assertNotIn("image_data", img_part)
+        self.assertEqual(img_part["mime_type"], "image/jpeg")
+
+    def test_helper_sends_response_format_schema(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        client = _mock_client(CANNED_MACROS_JSON)
+        with mock.patch.object(food_reader, "client", client):
+            food_reader.helper_get_macro_nutrients_from_photos([photo])
+        kwargs = client.interactions.create.call_args.kwargs
+        self.assertEqual(
+            kwargs["response_format"]["schema"]["required"],
+            ["calories", "protein", "carbohydrates", "fats"],
+        )
+
+    def test_is_it_same_meal_yes(self):
+        folder = _DATA_DIR / "p01" / "food-images"
+        pair = (
+            (str(folder / "IMG_8916.jpeg"), "2019-11-02 12:00:00.000"),
+            (str(folder / "IMG_8917.jpeg"), "2019-11-02 12:05:00.000"),
+        )
+        with mock.patch.object(food_reader, "client", _mock_client("YES")):
+            self.assertTrue(food_reader.is_it_same_meal(*pair))
+
+    def test_preselector_with_dated_tuples(self):
+        from datetime import datetime
+
+        files = [
+            ("a.jpg", datetime(2020, 1, 1, 12, 0, 0)),
+            ("b.jpg", datetime(2020, 1, 1, 12, 10, 0)),
+        ]
+        self.assertEqual(
+            food_reader.same_meal_preselector(files, 1800),
+            {"a.jpg": ["b.jpg"], "b.jpg": ["a.jpg"]},
+        )
+
+    def test_pipeline_single_real_photo(self):
+        photo = str(_DATA_DIR / "p01" / "food-images" / "IMG_8916.jpeg")
+        with mock.patch.object(food_reader, "is_photo_food", return_value=True), \
+             mock.patch.object(food_reader, "client", _mock_client(CANNED_MACROS_JSON)):
+            result = food_reader.get_macro_nutrients_from_photos([photo])
+        self.assertEqual(result, {(photo,): CANNED_MACROS})
+
+    def test_pipeline_empty_input(self):
+        self.assertEqual(food_reader.get_macro_nutrients_from_photos([]), {})
+
+    def test_photo_selector_unknown_player(self):
+        self.assertEqual(food_reader.photo_selector_by_date_player("p99", "2019-11-01"), [])
+
+    def test_photo_selector_returns_list(self):
+        result = food_reader.photo_selector_by_date_player("p01", "2019-11-01", "2020-03-31")
+        self.assertIsInstance(result, list)
+
+
+class TestAggregator(unittest.TestCase):
+    def test_aggregate_all_keys(self):
+        result = aggregator.aggregate_all("p01", "2019-11-02")
+        self.assertEqual(
+            sorted(result),
+            ["activity", "end_date", "injury", "nutrition", "player_id", "questionnaire", "sleep", "start_date"],
+        )
+        self.assertEqual(result["start_date"], "2019-11-02")
+        self.assertEqual(result["end_date"], "2019-11-02")
+
+    def test_sleep_morning_attribution(self):
+        result = aggregator.aggregate_sleep("p01", "2019-11-02")
+        self.assertTrue(result["has_sleep_record"])
+        nights = {n["date_of_sleep"] for n in result["nights"]}
+        self.assertIn("2019-11-02", nights)
+        night = next(n for n in result["nights"] if n["date_of_sleep"] == "2019-11-02")
+        self.assertEqual(night["minutes_asleep"], 378)
+
+    def test_activity_window_sums(self):
+        result = aggregator.aggregate_activity("p01", "2019-11-01", "2019-11-02")
+        expected = float(
+            fitbit_reader.steps_reader("p01", "2019-11-01", "2019-11-02").sum()
+        )
+        self.assertAlmostEqual(result["total_steps"], expected)
+
+    def test_nutrition_meal_count(self):
+        result = aggregator.aggregate_nutrition("p01", "06/11/2019")
+        self.assertEqual(result["n_meals_logged"], 2)
+        self.assertEqual(result["meal_names"], ["Breakfast", "Dinner"])
+
+    def test_injury_flag(self):
+        result = aggregator.aggregate_injury("p01", "2020-01-07")
+        self.assertTrue(result["is_injured"])
+        self.assertIn("right_hand", next(iter(result["injuries"].values())))
+
+    def test_render_markdown(self):
+        report = aggregator.render(aggregator.aggregate_all("p01", "2019-11-02"))
+        self.assertIn("# Daily report — p01 — 2019-11-02", report)
+        self.assertIn("## Nutrition", report)
+        self.assertNotIn("placeholder", report)
+
+    def test_format_distance_units(self):
+        self.assertEqual(aggregator.format_distance(45), "45 cm")
+        self.assertEqual(aggregator.format_distance(2500), "25 m")
+        self.assertEqual(aggregator.format_distance(750000), "7.5 km")
+        self.assertEqual(aggregator.format_distance(None), "n/a")
+
+    def test_activity_distance_display(self):
+        result = aggregator.aggregate_activity("p01", "2019-11-01")
+        self.assertIn("total_distance_display", result)
+        self.assertTrue(
+            result["total_distance_display"].endswith(("cm", "m", "km"))
+        )
+
+    def test_render_missing_data_shows_na(self):
+        report = aggregator.render(aggregator.aggregate_all("p99", "2019-11-02"))
+        self.assertIn("n/a", report)
 
 
 if __name__ == "__main__":
