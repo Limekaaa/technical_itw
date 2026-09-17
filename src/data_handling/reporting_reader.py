@@ -17,6 +17,7 @@ import pandas as pd
 from src.utils.date_handler import standardize_date, _resolve_bounds, _is_date_only
 
 _BASE_DIR = Path(__file__).resolve().parents[2]
+_DATA_DIR = _BASE_DIR / "data"
 
 
 def _matches(ts_std: str, lower: str, upper: str, upper_inclusive: bool) -> bool:
@@ -30,7 +31,7 @@ def _matches(ts_std: str, lower: str, upper: str, upper_inclusive: bool) -> bool
 def reporting_reader(player_id: str, start_date: str, end_date=None) -> pd.DataFrame:
     """Daily reporting rows whose ``date`` falls in the time span."""
     lower, upper, upper_inclusive = _resolve_bounds(start_date, end_date)
-    path = _BASE_DIR / player_id / "googledocs" / "reporting.csv"
+    path = _DATA_DIR / player_id / "googledocs" / "reporting.csv"
     if not path.is_file():
         return pd.DataFrame()
     df = pd.read_csv(path)
