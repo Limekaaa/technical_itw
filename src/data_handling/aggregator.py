@@ -290,3 +290,269 @@ def render(daily: dict) -> str:
     elif nutrition.get("n_food_photos"):
         lines += ["", "_Calories/macros estimated from meal photos by Gemini._"]
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Pre-processing extensions (additive; existing functions above unchanged).
+#
+# These pure helpers back ``src/pre_processing/pre_processor.py``. They reuse
+# the same readers and date handling. Nothing above this section was
+# modified, so all existing callers (main.py report path, unit tests) are
+# unaffected.
+# ---------------------------------------------------------------------------
+
+import ast as _ast
+import math as _math
+
+# Canonical activity labels for one-hot encoding of exercise bouts and
+# sRPE ``activity_names`` JSON lists (observed values across p01/p03/p05).
+CANONICAL_ACTIVITIES = (
+    "individual", "running", "endurance", "strength", "team", "soccer",
+    "walk", "bike",
+)
+
+# Edwards-TRIMP zone weights (zone minutes x weight). Zones are
+# participant-relative (% of max HR); weights follow the 1..4 ladder.
+TRIMP_WEIGHTS = {
+    "BELOW_DEFAULT_ZONE_1": 1.0,
+    "IN_DEFAULT_ZONE_1": 2.0,
+    "IN_DEFAULT_ZONE_2": 3.0,
+    "IN_DEFAULT_ZONE_3": 4.0,
+}
+
+
+def _safe_float(value, default=None):
+    """Coerce to float, returning ``default`` on failure/NaN."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if isinstance(v, float) and _math.isnan(v):
+        return default
+    return v
+
+
+def aggregate_hr_stats(hr_dict: dict) -> dict:
+    """Daily HR statistics from a cleaned ``{ts: {bpm, confidence}}`` dict.
+
+    Expects confidence-filtered + clipped input (see
+    ``outliers_handler``). Returns mean/sd/peak bpm, sample count,
+    mean confidence and minute coverage (distinct minutes with >= 1
+    sample). Empty input yields NaNs/zeros (never raises).
+    """
+    bpms, confs, minutes = [], [], set()
+    for ts, payload in (hr_dict or {}).items():
+        bpm = (payload or {}).get("bpm")
+        bpm = _safe_float(bpm)
+        if bpm is None:
+            continue
+        bpms.append(bpm)
+        conf = _safe_float((payload or {}).get("confidence"))
+        if conf is not None:
+            confs.append(conf)
+        if isinstance(ts, str) and len(ts) >= 16:
+            minutes.add(ts[:16])
+    if not bpms:
+        return {"hr_mean": None, "hr_sd": None, "hr_peak": None,
+                "hr_n_samples": 0, "mean_conf": None, "hr_cov_min": 0}
+    import pandas as _pd
+    series = _pd.Series(bpms, dtype=float)
+    return {"hr_mean": round(float(series.mean()), 2),
+            "hr_sd": round(float(series.std()), 2) if len(series) > 1 else 0.0,
+            "hr_peak": float(series.max()),
+            "hr_n_samples": int(len(series)),
+            "mean_conf": round(float(sum(confs) / len(confs)), 3) if confs else None,
+            "hr_cov_min": int(len(minutes))}
+
+
+def trimp_edwards(zones_min: dict) -> float:
+    """Edwards TRIMP = sum over zones of minutes x weight."""
+    total = 0.0
+    for zone, minutes in (zones_min or {}).items():
+        total += float(minutes or 0.0) * float(TRIMP_WEIGHTS.get(zone, 0.0))
+    return round(total, 1)
+
+
+def exercise_minutes(exercise_list: list) -> dict:
+    """Exercise-bout rollup: ms -> min, artifact-bout drop, activities.
+
+    Uses ``activeDuration ?? duration`` (ms -> min by /60000) and drops
+    <= 0.03-min artifact bouts (phase-3 checklist). Returns total
+    minutes (rounded 1 dp), session count and sorted activity names.
+    """
+    durations = []
+    activities = set()
+    for entry in exercise_list or []:
+        raw = entry.get("activeDuration", entry.get("duration", 0)) or 0
+        minutes = _safe_float(raw, 0.0) / 60000.0
+        if minutes <= 0.03:
+            continue
+        durations.append(minutes)
+        name = entry.get("activityName")
+        if name:
+            activities.add(name)
+    return {"exercise_min": round(sum(durations), 1),
+            "n_exercise_sessions": len(durations),
+            "activities": sorted(activities)}
+
+
+def canonical_activity_flags(names: list) -> dict:
+    """One-hot flags over ``CANONICAL_ACTIVITIES`` for a name list.
+
+    Matching is case-insensitive substring on each name (so ``"Outdoor
+    Bike"`` maps to ``bike``, ``"Sport"`` maps to nothing).
+    """
+    lowered = [str(n).lower() for n in (names or [])]
+    flags = {}
+    for canon in CANONICAL_ACTIVITIES:
+        flags[f"act_{canon}"] = int(any(canon in item for item in lowered))
+    return flags
+
+
+def parse_activity_names(raw) -> list:
+    """Parse an sRPE ``activity_names`` JSON-list cell to lower names."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = _ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return []
+    if not isinstance(parsed, (list, tuple)):
+        return []
+    return [str(item).strip().lower() for item in parsed if str(item).strip()]
+
+
+def parse_soreness_area(raw) -> tuple:
+    """Parse a wellness ``soreness_area`` cell.
+
+    Returns ``(areas, soreness_any, n_zones)``; ``[]`` maps to no-pain
+    (``False``/``0``), never NaN.
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return [], False, 0
+    text = str(raw).strip()
+    if text in ("", "[]"):
+        return [], False, 0
+    try:
+        parsed = _ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return [], False, 0
+    areas = [str(a) for a in parsed] if isinstance(parsed, (list, tuple)) else []
+    return areas, bool(areas), len(areas)
+
+
+def alcohol_to_bin(raw):
+    """Map reporting ``alcohol_consumed`` Yes/No to 1/0 (else None)."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    text = str(raw).strip().lower()
+    if text == "yes":
+        return 1
+    if text == "no":
+        return 0
+    return None
+
+
+def reporting_lag_days(date_str, timestamp_str):
+    """Recall proxy: submission ``timestamp`` minus log ``date`` in days."""
+    try:
+        d_std = standardize_date(str(date_str))
+        t_std = standardize_date(str(timestamp_str))
+        if not d_std or not t_std:
+            return None
+        d = datetime.strptime(d_std, DATE_FORMAT)
+        t = datetime.strptime(t_std, DATE_FORMAT)
+        return round((t - d).total_seconds() / 86400.0, 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def _hour_of_day(std_ts: str):
+    """Hour-of-day float from a standardized timestamp (None on failure)."""
+    try:
+        dt = datetime.strptime(std_ts, DATE_FORMAT)
+        return round(dt.hour + dt.minute / 60.0 + dt.second / 3600.0, 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def aggregate_sleep_daily(player_id: str, start_date: str, end_date=None) -> dict:
+    """Extended daily sleep features (single-day grain building block).
+
+    Same morning-attribution as :func:`aggregate_sleep` (nights ENDING in
+    the window), plus: ``classic``-type flagging (stage splits unavailable
+    -> stage minutes/pcts NaN), ``mainSleep == False`` nap exclusion with
+    separate ``n_naps``, onset/offset/midsleep hours, stage percentages,
+    WASO and full sleep-score means. Nap-only days report
+    ``has_sleep_record == False`` with ``n_naps >= 1``.
+    """
+    lower, upper, upper_inclusive = _window_bounds(start_date, end_date)
+    lookback = (datetime.strptime(standardize_date(start_date), DATE_FORMAT) - timedelta(days=1)).strftime("%Y-%m-%d")
+    sleeps = fitbit_reader.sleep_reader(player_id, lookback, end_date or start_date)
+    main_nights, naps = [], 0
+    for record in sleeps.values():
+        end_std = standardize_date(str(record.get("endTime", "")))
+        if not end_std or not _matches(end_std, lower, upper, upper_inclusive):
+            continue
+        if not record.get("mainSleep", True):
+            naps += 1
+            continue
+        main_nights.append(record)
+    # Prefer the longest main sleep when several qualify (rare).
+    main_nights.sort(key=lambda r: (r.get("minutesAsleep") or 0))
+    night = main_nights[-1] if main_nights else None
+    out = {"n_nights": len(main_nights), "n_naps": naps,
+           "has_sleep_record": bool(main_nights), "is_classic": None}
+    if night is None:
+        out.update({"asleep_min": None, "time_in_bed_min": None, "efficiency_pct": None,
+                    "deep_min": None, "light_min": None, "rem_min": None, "wake_min": None,
+                    "deep_pct": None, "light_pct": None, "rem_pct": None, "wake_pct": None,
+                    "onset_hour": None, "offset_hour": None, "midsleep_hour": None})
+    else:
+        is_classic = night.get("type") == "classic"
+        out["is_classic"] = bool(is_classic)
+        levels = (night.get("levels") or {}).get("summary", {})
+        if is_classic:
+            deep = light = rem = wake = None
+            wake_raw = (levels.get("awake") or {}).get("minutes")
+            wake_min = _safe_float(wake_raw)
+        else:
+            deep = _safe_float((levels.get("deep") or {}).get("minutes"))
+            light = _safe_float((levels.get("light") or {}).get("minutes"))
+            rem = _safe_float((levels.get("rem") or {}).get("minutes"))
+            wake_min = _safe_float((levels.get("wake") or {}).get("minutes"))
+        asleep = _safe_float(night.get("minutesAsleep"))
+        stage_sum = None
+        if not is_classic and None not in (deep, light, rem, wake_min) and sum([deep, light, rem, wake_min]) > 0:
+            stage_sum = deep + light + rem + wake_min
+        out.update({"asleep_min": asleep,
+                    "time_in_bed_min": _safe_float(night.get("timeInBed")),
+                    "efficiency_pct": _safe_float(night.get("efficiency")),
+                    "deep_min": deep, "light_min": light, "rem_min": rem, "wake_min": wake_min,
+                    "deep_pct": round(100 * deep / stage_sum, 2) if stage_sum else None,
+                    "light_pct": round(100 * light / stage_sum, 2) if stage_sum else None,
+                    "rem_pct": round(100 * rem / stage_sum, 2) if stage_sum else None,
+                    "wake_pct": round(100 * wake_min / stage_sum, 2) if stage_sum else None})
+        onset = _hour_of_day(standardize_date(str(night.get("startTime", ""))))
+        offset = _hour_of_day(standardize_date(str(night.get("endTime", ""))))
+        out["onset_hour"] = onset
+        out["offset_hour"] = offset
+        if onset is not None and offset is not None:
+            dur = (offset - onset) % 24
+            out["midsleep_hour"] = round((onset + dur / 2.0) % 24, 2)
+        else:
+            out["midsleep_hour"] = None
+    scores = fitbit_reader.sleep_score_reader(player_id, start_date, end_date)
+    for col in ("overall_score", "composition_score", "revitalization_score",
+                "duration_score", "deep_sleep_in_minutes", "restlessness"):
+        if col in scores.columns and len(scores):
+            vals = pd.to_numeric(scores[col], errors="coerce").dropna()
+            if col == "restlessness":
+                vals = vals.clip(0.03, 0.20)
+            out[f"mean_{col}"] = round(float(vals.mean()), 2) if len(vals) else None
+        else:
+            out[f"mean_{col}"] = None
+    return out
