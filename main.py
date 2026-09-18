@@ -22,7 +22,34 @@ def main() -> None:
     parser.add_argument("--start", default="2019-11-02")
     parser.add_argument("--end", default=None)
     parser.add_argument("--meal-timedelta", type=int, default=1800)
+    parser.add_argument("--preprocess", action="store_true",
+                        help="Build the training-ready dataset instead of a Markdown report.")
+    parser.add_argument("--players", default="p01,p03,p05",
+                        help="Comma-separated players for --preprocess.")
+    parser.add_argument("--out", default=None,
+                        help="Output CSV for --preprocess (default: output_dataset/training_dataset.csv).")
     args = parser.parse_args()
+
+    if args.preprocess:
+        from pathlib import Path as _Path
+        from src.pre_processing.pre_processor import (
+            build_training_dataset, save_dataset, get_feature_columns,
+            HORIZON_START, HORIZON_END,
+        )
+        players = [p.strip() for p in args.players.split(",") if p.strip()]
+        # Daily-grain horizon confirmed with the user; --start/--end fall
+        # back to it unless explicitly overridden on the CLI.
+        start = args.start if args.start != "2019-11-02" else HORIZON_START
+        end = args.end or HORIZON_END
+        df = build_training_dataset(players, start, end, args.meal_timedelta
+                                    if args.meal_timedelta != 1800 else 15)
+        out_path = _Path(args.out) if args.out else None
+        saved = save_dataset(df, out_path)
+        print(f"Dataset shape: {df.shape}")
+        print(f"Label availability: {int(df['label_available'].sum())}/{len(df)} rows")
+        print(f"Feature columns: {len(get_feature_columns(df))}")
+        print(f"Saved dataset to {saved}")
+        return
 
     start = args.date or args.start
     end = None if args.date else args.end
